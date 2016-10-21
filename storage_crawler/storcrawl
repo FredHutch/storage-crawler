@@ -1,0 +1,21 @@
+#! /bin/bash
+#  * LF Backup *
+#  wrapper for storcrawl.py
+# 
+
+scriptname=${0##*/}
+cwd=$(pwd)
+
+# custom python loaded via "Environment Modules"
+if [ -d $MODULESHOME ]; then
+  module unload python3 > /dev/null 2>&1
+  module unload python2 > /dev/null 2>&1
+  if [[ "$USER" == "mylegacyuser" ]]; then
+    echo "using 3.4.3"
+    module load python3/3.4.3 > /dev/null 2>&1
+  else
+    module load python3/3.5.0 > /dev/null 2>&1
+  fi
+fi
+
+./${scriptname}.py $@
