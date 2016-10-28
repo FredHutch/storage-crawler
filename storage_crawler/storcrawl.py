@@ -18,7 +18,7 @@ p = configargparse.ArgParser(default_config_files=['/etc/storcrawlrc','~/storcra
                   epilog="Note: arguments with [+] can be specified more than once, except as ENV VARs")
 
 # config file location
-p.add_argument('-c', '--config-file', env_var='STORCRAWL_CONFIG_FILE', help='config file path')
+p.add_argument('-c', '--config-file', env_var='STORCRAWL_CONFIG_FILE', help='config file path', is_config_file=True)
 # config debug and verbose switches
 p.add_argument('-d', '--debug', env_var='STORCRAWL_DEBUG', help='debugging', action='store_true', default=False)
 p.add_argument('-v', '--verbose', env_var='STORCRAWL_VERBOSE', help='verbose', action='store_true', default=False)
@@ -110,7 +110,7 @@ def database_init(db_conn_str, tag):
         qry = """CREATE TABLE {}(
                  id SERIAL,
                  insert_time timestamp with time zone DEFAULT now () NOT NULL,
-                 path text NOT NULL,
+                 path bytea NOT NULL,
                  st_mode bit(19) NOT NULL,
                  st_ino bigint NOT NULL,
                  st_dev text NOT NULL,
@@ -132,7 +132,7 @@ def database_init(db_conn_str, tag):
     try:
         qry = """CREATE TABLE {}(
                  id SERIAL,
-                 path text NOT NULL,
+                 path bytea NOT NULL,
                  errno int NOT NULL,
                  strerror text NOT NULL,
                  owner text)
@@ -407,7 +407,7 @@ def walker_process(dir_queue, file_queue, dir_count, file_count, dlock, flock, l
     logger.debug("{} exiting my count was {}".format(myname, tot_count))
 
 # status process to update status metrics during crawl
-def status_process(file_done_count, file_count, dir_done_count, dir_count, files_committed):
+def status_process(fileq, dirq, file_done_count, file_count, dir_done_count, dir_count, files_committed):
     conn = psycopg2.connect(db_conn_str)
     cur = conn.cursor()
     fs = 0   # files stated
@@ -420,7 +420,7 @@ def status_process(file_done_count, file_count, dir_done_count, dir_count, files
             # calculate rates
             stat_rate = (file_done_count.value - fs) / update_interval
             found_file_rate = (file_count.value - ft) / update_interval
-            walk_rate = (dir_done_count.value) - dw / update_interval
+            walk_rate = (dir_done_count.value - dw) / update_interval
             found_dir_rate = (dir_count.value - dt) / update_interval
             commit_rate = (files_committed.value - fc) / update_interval
 
@@ -430,12 +430,14 @@ def status_process(file_done_count, file_count, dir_done_count, dir_count, files
                 {'status': 'stat rate', 'value': stat_rate, 'units': 'files/sec'},
                 {'status': 'total', 'value': file_count.value, 'units': 'files'},
                 {'status': 'discovery rate', 'value': found_file_rate, 'units': 'files/sec'},
+                {'status': 'committed', 'value': files_committed.value, 'units': 'files'},
+                {'status': 'commit rate', 'value': commit_rate, 'units': 'commits/sec'},
                 {'status': 'walked', 'value': dir_done_count.value, 'units': 'dirs'},
                 {'status': 'walk rate', 'value': walk_rate, 'units': 'dirs/sec'},
                 {'status': 'total', 'value': dir_count.value, 'units': 'dirs'},
                 {'status': 'discovery rate', 'value': found_dir_rate, 'units': 'dirs/sec'},
-                {'status': 'committed', 'value': files_committed.value, 'units': 'files'},
-                {'status': 'commit rate', 'value': commit_rate, 'units': 'commits/sec'},
+                {'status': 'queue size', 'value': fileq.qsize(), 'units': 'files'},
+                {'status': 'queue size', 'value': dirq.qsize(), 'units': 'dirs'},
             ]
 
             # run the update
@@ -546,7 +548,7 @@ def begin_scan():
 
     # create a status printer
     logger.debug("creating status update process")
-    status_p = multiprocessing.Process(target=status_process, args=(file_done_count, file_count, dir_done_count, dir_count, files_committed))
+    status_p = multiprocessing.Process(target=status_process, args=(file_queue, dir_queue, file_done_count, file_count, dir_done_count, dir_count, files_committed))
     status_p.start()
 
     # starting crawl
