@@ -118,9 +118,9 @@ def database_init(db_conn_str, tag):
                  st_uid bigint NOT NULL,
                  st_gid bigint NOT NULL,
                  st_size bigint NOT NULL,
-                 st_atime int NOT NULL,
-                 st_mtime int NOT NULL,
-                 st_ctime int NOT NULL,
+                 st_atime bigint NOT NULL,
+                 st_mtime bigint NOT NULL,
+                 st_ctime bigint NOT NULL,
                  owner text)
               """.format(filestablename)
         cur.execute(qry)
