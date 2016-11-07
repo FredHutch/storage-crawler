@@ -5,6 +5,8 @@ import time
 import sys
 import psycopg2
 import psycopg2.extensions
+import json
+from datetime import datetime
 
 # config parser
 p = configargparse.ArgParser(default_config_files=['/etc/storcrawlrc','~/storcrawlrc','~/.storcrawlrc'],
@@ -26,6 +28,8 @@ p.add_argument('-N', '--dbname', env_var='STORCRAWL_DBNAME', help='database name
 p.add_argument('-l', '--logdir', env_var='STORCRAWL_LOGDIR', help='logfile location [./]', default='./')
 # config tag/label
 p.add_argument('-t', '--tag', env_var='STORCRAWL_TAG', help='a tag to identify the crawl results', required=True)
+# action/command
+p.add_argument('action', help='action command', metavar='ACTION')
 
 config = p.parse_args()
 #print(config)
@@ -41,7 +45,6 @@ psycopg2.extensions.register_type(psycopg2.extensions.UNICODE)
 psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
 
 def database_init(db_conn_str, tag):
-    sys.stderr.write(db_conn_str)
     try:
         conn = psycopg2.connect(db_conn_str)
         cur = conn.cursor()
@@ -59,6 +62,9 @@ def database_init(db_conn_str, tag):
     except psycopg2.Error as e:
         sys.stderr.write("Error checking on schema: {}".format(e.pgerror))
         sys.exit(1)
+    set_schema(cur)
+
+def set_schema(cur):
     # set default schema
     try:
         qry = """SET search_path TO %(search_path)s"""
@@ -68,7 +74,8 @@ def database_init(db_conn_str, tag):
         sys.stderr.write("Error setting search_path: {}".format(e.pgerror))
         sys.exit(1)
 
-def IterResults(cursor, arraysize=1000):
+def IterResults(cursor, label, arraysize=1000):
+    yield label
     while True:
         results = cur.fetchmany(arraysize)
         if not results:
@@ -76,22 +83,119 @@ def IterResults(cursor, arraysize=1000):
         for result in results:
             yield result
 
-def space_by_owner():
+def display(data):
+    header = True
+    for row in iter(data):
+        if header:
+            print(row)
+            header = False
+        else:
+            my_row = []
+            for col in row:
+                if type(col) is datetime:
+                    my_row.append(col.isoformat(' '))
+                else:
+                    my_row.append(repr(col))
+            print(','.join(my_row))
+
+def get_schema(cur,tbl):
+    label = "{} table: name, data type, default value:".format(tbl)
     try:
-        qry = """SELECT * FROM storcrawl_{}.files limit 10""".format(config.tag)
+        qry = """SELECT column_name, data_type, column_default
+                 FROM information_schema.columns
+                 WHERE table_name = %(table)s"""
+        cur.execute(qry,{'table':tbl})
+    except psycopg2.Error as e:
+        sys.stderr.write("DB Error: {}".format(e.pgerror))
+    return IterResults(cur, label)
+
+def get_status(cur, option=None):
+    if option == 'full':
+        label = "current status(full):"
+        try:
+            qry = """SELECT date_trunc('sec',time),status,value,units
+                     FROM status
+                     ORDER BY time ASC"""
+            cur.execute(qry)
+        except psycopg2.Error as e:
+            sys.stderr.write("DB Error: {}".format(e.pgerror))
+        return IterResults(cur, label)
+    elif option == 'events':
+        label = "current status(events):"
+        try:
+            qry = """SELECT date_trunc('sec',time), status
+                     FROM status
+                     WHERE units = 'event'
+                     ORDER BY time ASC"""
+            cur.execute(qry)
+        except psycopg2.Error as e:
+            sys.stderr.write("DB Error: {}".format(e.pgerror))
+        return IterResults(cur, label)
+    elif option == 'averages':
+        label = "current status(averages):"
+        try:
+            qry = """SELECT av.status, av.avg, av.units
+                     FROM (SELECT status, AVG(value) as avg, units
+                           FROM status
+                           WHERE status like '%rate'
+                           GROUP BY status, units)
+                     AS av
+                     ORDER BY units"""
+            cur.execute(qry)
+        except psycopg2.Error as e:
+            sys.stderr.write("DB Error: {}".format(e.pgerror))
+        return IterResults(cur, label)
+    else:
+        label = "current status(brief):"
+        try:
+            qry = """SELECT date_trunc('sec',time), status, value, units
+                     FROM status
+                     WHERE id
+                     IN (SELECT MAX(id)
+                         FROM status
+                         GROUP BY status)
+                     ORDER BY time ASC"""
+            cur.execute(qry)
+        except psycopg2.Error as e:
+            sys.stderr.write("DB Error: {}".format(e.pgerror))
+        return IterResults(cur, label)
+        
+def first_thousand():
+    label = "First 1000 files metadata"
+    try:
+        qry = """SELECT *
+                 FROM storcrawl_{}.files
+                 LIMIT 1000""".format(config.tag)
         cur.execute(qry)
-        return IterResults(cur)
     except psycopg2.Error as e:
         sys.stderr.write("Error SELECTING: {}".format(e.pgerror))
+    return IterResults(cur)
 
 if __name__ == '__main__':
     database_init(db_conn_str,config.tag)
     conn = psycopg2.connect(db_conn_str)
     cur = conn.cursor()
+    set_schema(cur)
 
-    # see storcrawl.sql for table schemas
+    if config.action.lower() == 'schema-status':
+        display(get_schema(cur,'status'))
+    if config.action.lower() == 'schema-files':
+        display(get_schema(cur,'files'))
+    if config.action.lower() == 'schema-all':
+        display(get_schema(cur,'status'))
+        display(get_schema(cur,'files'))
+    if config.action.lower() == 'status':
+        display(get_status(cur, 'brief'))
+    if config.action.lower() == 'status-brief':
+        display(get_status(cur, 'brief'))
+    if config.action.lower() == 'status-full':
+        display(get_status(cur, 'full'))
+    if config.action.lower() == 'status-averages':
+        display(get_status(cur, 'averages'))
+    if config.action.lower() == 'status-events':
+        display(get_status(cur, 'events'))
+    if config.action.lower() == 'totals':
+        display(get_totals(cur))
 
-    for row in space_by_owner():
-        print(row)
-    
+    conn.close()
     exit()

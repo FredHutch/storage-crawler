@@ -590,7 +590,7 @@ def begin_scan():
     status_p.start()
 
     # starting crawl
-    update_status(conn,cur,{'status': 'begin', 'value':1, 'units': ''})
+    update_status(conn,cur,{'status': 'begin', 'value':1, 'units': 'event'})
 
     # feed top dir into dir_queue
     for path in config.dir:
@@ -617,12 +617,12 @@ def begin_scan():
         db_procs.append(p)
         logger.debug("created db process {}".format(p.name))
 
-    update_status(conn,cur,{'status': 'all processes spawned', 'value': 1, 'units': ''})
+    update_status(conn,cur,{'status': 'all processes spawned', 'value': 1, 'units': 'event'})
 
     # wait for directory queue to be empty
     dir_queue.join()
     logger.debug("joined dir_queue")
-    update_status(conn,cur,{'status': 'processed all dirs', 'value': 1, 'units': ''})
+    update_status(conn,cur,{'status': 'processed all dirs', 'value': 1, 'units': 'event'})
     for p in walker_procs:
         dir_queue.put(None)
     logger.debug("sent sentinel to walker processes")
@@ -630,7 +630,7 @@ def begin_scan():
     # wait for file queue to be empty
     file_queue.join()
     logger.debug("joined file_queue")
-    update_status(conn,cur,{'status': 'processed all files', 'value': 1, 'units': ''})
+    update_status(conn,cur,{'status': 'processed all files', 'value': 1, 'units': 'event'})
     for p in stater_procs:
         file_queue.put(None)
     logger.debug("sent sentinel to stater processes")
@@ -638,13 +638,13 @@ def begin_scan():
     # wait for db queue to be empty
     db_queue.join()
     logger.debug("joined db_queue")
-    update_status(conn,cur,{'status': 'processed all DB commits', 'value': 1, 'units': ''})
+    update_status(conn,cur,{'status': 'processed all DB commits', 'value': 1, 'units': 'event'})
     for p in db_procs:
         db_queue.put(None)
     logger.debug("sent sentinel to db processes")
 
     # ending crawl
-    update_status(conn,cur,{'status': 'end', 'value':1, 'units': ''})
+    update_status(conn,cur,{'status': 'end', 'value':1, 'units': 'event'})
 
     # close logging
     log_queue.join()
