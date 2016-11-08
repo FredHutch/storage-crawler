@@ -5,7 +5,9 @@ import time
 import sys
 import psycopg2
 import psycopg2.extensions
+from psycopg2.extras import DictCursor
 import json
+import collections
 from datetime import datetime
 
 # config parser
@@ -47,7 +49,7 @@ psycopg2.extensions.register_type(psycopg2.extensions.UNICODEARRAY)
 def database_init(db_conn_str, tag):
     try:
         conn = psycopg2.connect(db_conn_str)
-        cur = conn.cursor()
+        cur = conn.cursor(cursor_factory=DictCursor)
     except psycopg2.Error as e:
         sys.stderr.write("Error connecting to databse: {}".format(e.pgerror))
         sys.exit(1)
@@ -160,7 +162,8 @@ def get_status(cur, option=None):
             sys.stderr.write("DB Error: {}".format(e.pgerror))
         return IterResults(cur, label)
         
-def first_thousand():
+# example just returning the first 1000 entries
+def first_thousand(cur):
     label = "First 1000 files metadata"
     try:
         qry = """SELECT *
@@ -169,12 +172,46 @@ def first_thousand():
         cur.execute(qry)
     except psycopg2.Error as e:
         sys.stderr.write("Error SELECTING: {}".format(e.pgerror))
-    return IterResults(cur)
+    return IterResults(cur, label)
+
+# returning files >= min_size_bytes and >= min_delta_secs ago
+def large_old_files(cur, min_size_bytes, min_delta_secs):
+    try:
+        qry = """SELECT EXTRACT(EPOCH FROM DATE_TRUNC('sec',insert_time)) AS insert_ts,
+                  ENCODE(path,'escape') AS path, ENCODE(extension,'escape') AS ext,
+                  st_uid, st_gid, st_size, st_atime, st_ctime, st_mtime, owner
+                 FROM storcrawl_{}.files
+                 WHERE
+                 st_size >= {} and
+                 (((st_ctime + {}) >= EXTRACT(EPOCH FROM NOW())) or
+                 (st_mtime + {}) >= EXTRACT(EPOCH FROM NOW()))
+                 ORDER BY
+                 GREATEST(st_mtime, st_ctime) DESC,
+                 LEAST(st_mtime,st_ctime) DESC""".format(config.tag,min_size_bytes,min_delta_secs,min_delta_secs)
+        cur.execute(qry)
+    except psycopg2.Error as e:
+        sys.stderr.write("Error SELECTING: {}".format(e.pgerror))
+    rows = cur.fetchall()
+    row_list = []
+    for row in rows:
+        d = collections.OrderedDict()
+        d['insert_ts'] = row['insert_ts']
+        d['path'] = row['path']
+        d['ext'] = row['ext']
+        d['uid'] = row['st_uid']
+        d['gid'] = row['st_gid']
+        d['size'] = row['st_size']
+        d['atime'] = row['st_atime']
+        d['ctime'] = row['st_ctime']
+        d['mtime'] = row['st_mtime']
+        d['owner'] = row['owner']
+        row_list.append(d)
+    print(json.dumps(row_list, indent=2))
 
 if __name__ == '__main__':
     database_init(db_conn_str,config.tag)
     conn = psycopg2.connect(db_conn_str)
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=DictCursor)
     set_schema(cur)
 
     if config.action.lower() == 'schema-status':
@@ -194,8 +231,8 @@ if __name__ == '__main__':
         display(get_status(cur, 'averages'))
     if config.action.lower() == 'status-events':
         display(get_status(cur, 'events'))
-    if config.action.lower() == 'totals':
-        display(get_totals(cur))
+    if config.action.lower() == 'large_old_files':
+        large_old_files(cur, 3221225472, 608400)
 
     conn.close()
     exit()
