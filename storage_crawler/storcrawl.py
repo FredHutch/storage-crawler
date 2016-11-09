@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import psycopg2
 import psycopg2.extensions
+from psycopg2.extras import Json
 
 # config parser
 p = configargparse.ArgParser(default_config_files=['/etc/storcrawlrc','~/storcrawlrc','~/.storcrawlrc'],
@@ -154,11 +155,7 @@ def database_init(db_conn_str, tag):
     # create new status table for crawl
     try:
         qry = """CREATE TABLE {}.status(
-                 id SERIAL,
-                 time timestamp with time zone DEFAULT now() NOT NULL,
-                 status text NOT NULL,
-                 value int,
-                 units text)
+                 entry jsonb NOT NULL)
               """.format(schemaname)
         cur.execute(qry)
         conn.commit()
@@ -303,19 +300,16 @@ def log_listener_process(queue):
         queue.task_done()
 
 # update status table
-def update_status(conn,cur,status_msg):
-    qry="""INSERT INTO {}.status (
-           status,
-           value,
-           units) 
-           VALUES(
-           %(status)s,
-           %(value)s,
-           %(units)s) ;
-        """.format(schemaname)
-    cur.execute(qry,status_msg)
-    conn.commit()
-
+def update_status(conn,cur,entry):
+    try:
+        qry="""INSERT INTO {}.status (
+            entry) VALUES(%s) ;
+            """.format(schemaname)
+        cur.execute(qry,[Json(entry)])
+        conn.commit()
+    except psycopg2.Error as e:
+        logger.debug("Error updating status: {}".format(e.pgerror))
+    
 # the function that inserts file metadata into the DB
 def db_process(db_queue, db_conn_str, files_committed, flock, log_queue, total_size):
     h = QueueHandler(log_queue)
@@ -497,47 +491,35 @@ def walker_process(dir_queue, file_queue, dir_count, file_count, dlock, flock, l
 def status_process(file_queue, dir_queue, db_queue, file_done_count, file_count, dir_done_count, dir_count, files_committed):
     conn = psycopg2.connect(db_conn_str)
     cur = conn.cursor()
-    fs = 0   # files stated
-    ft = 0   # files total
-    dw = 0   # dirs walked
-    dt = 0   # dirs total
-    fc = 0   # files committed
+    metrics = {}
+    metrics['files stated'] = {'value': 0, 'units': 'files'}
+    metrics['total files'] = {'value': 0, 'units': 'files'}
+    metrics['directories walked'] = {'value': 0, 'units': 'directories'}
+    metrics['total directories'] = {'value': 0, 'units': 'directories'}
+    metrics['file metadata inserts'] = {'value': 0, 'units': 'inserts'}
     while True:
         try:
             # calculate rates
-            stat_rate = (file_done_count.value - fs) / update_interval
-            found_file_rate = (file_count.value - ft) / update_interval
-            walk_rate = (dir_done_count.value - dw) / update_interval
-            found_dir_rate = (dir_count.value - dt) / update_interval
-            commit_rate = (files_committed.value - fc) / update_interval
+            metrics['file stat rate'] = { 'value': (file_done_count.value - metrics['files stated']['value']) / update_interval, 'units': 'files/sec'}
+            metrics['file walk rate'] = { 'value': (file_count.value - metrics['total files']['value']) / update_interval, 'units': 'entries/sec'}
+            metrics['insert rate'] = { 'value': (files_committed.value - metrics['file metadata inserts']['value']) / update_interval, 'units': 'inserts/sec'}
 
-            # build update
-            status_rows = [
-                {'status': 'stated', 'value': file_done_count.value, 'units': 'files'},
-                {'status': 'stat rate', 'value': stat_rate, 'units': 'files/sec'},
-                {'status': 'total', 'value': file_count.value, 'units': 'files'},
-                {'status': 'discovery rate', 'value': found_file_rate, 'units': 'files/sec'},
-                {'status': 'committed', 'value': files_committed.value, 'units': 'files'},
-                {'status': 'commit rate', 'value': commit_rate, 'units': 'commits/sec'},
-                {'status': 'walked', 'value': dir_done_count.value, 'units': 'dirs'},
-                {'status': 'walk rate', 'value': walk_rate, 'units': 'dirs/sec'},
-                {'status': 'total', 'value': dir_count.value, 'units': 'dirs'},
-                {'status': 'discovery rate', 'value': found_dir_rate, 'units': 'dirs/sec'},
-                {'status': 'queue size', 'value': dir_queue.qsize(), 'units': 'dirs'},
-                {'status': 'queue size', 'value': file_queue.qsize(), 'units': 'files'},
-                {'status': 'queue size', 'value': db_queue.qsize(), 'units': 'commits'},
-            ]
+            # update remembered values
+            metrics['files stated']['value'] = file_done_count.value
+            metrics['total files']['value'] = file_count.value
+            metrics['directories walked']['value'] = dir_done_count.value
+            metrics['total directories']['value'] = dir_count.value
+            metrics['file metadata inserts']['value'] = files_committed.value
+
+            # queue sizes update
+            metrics['file queue'] = {'value': file_queue.qsize(), 'units': 'files'}
+            metrics['directory queue'] = {'value': dir_queue.qsize(), 'units': 'directories'}
+            metrics['db queue'] = {'value': db_queue.qsize(), 'units': 'inserts'}
 
             # run the update
-            for status_msg in status_rows:
-                update_status(conn,cur,status_msg)
-
-            # remember old values
-            fs = file_done_count.value
-            ft = file_count.value
-            dw = dir_done_count.value
-            dt = dir_count.value
-            fc = files_committed.value
+            metrics['time'] = time.time()
+            update_status(conn,cur,metrics)
+            sys.stderr.write("Updated status: {}".format(metrics))
 
             # sleep
             time.sleep(update_interval)
@@ -590,7 +572,7 @@ def begin_scan():
     status_p.start()
 
     # starting crawl
-    update_status(conn,cur,{'status': 'begin', 'value':1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'begin'})
 
     # feed top dir into dir_queue
     for path in config.dir:
@@ -601,28 +583,28 @@ def begin_scan():
     while len(walker_procs) < num_walkers:
         p = multiprocessing.Process(target=walker_process, args=(dir_queue, file_queue, dir_count, file_count, dlock, flock, log_queue, exclusion_list))
         p.start()
-        update_status(conn,cur,{'status': 'walker started', 'value': p.pid, 'units': 'pid'})
+        update_status(conn,cur,{'time': time.time(), 'event': 'walker started', 'pid': p.pid})
         walker_procs.append(p)
         logger.debug("created walker {}".format(p.name))
     while len(stater_procs) < num_staters:
         p = multiprocessing.Process(target=stater_process, args=(file_queue, db_queue, file_done_count, flock, log_queue))
         p.start()
-        update_status(conn,cur,{'status': 'stater started', 'value': p.pid, 'units': 'pid'})
+        update_status(conn,cur,{'time': time.time(), 'event': 'stater started', 'pid': p.pid})
         stater_procs.append(p)
         logger.debug("created stater {}".format(p.name))
     while len(db_procs) < num_db:
         p = multiprocessing.Process(target=db_process, args=(db_queue, db_conn_str, files_committed, flock, log_queue, total_size))
         p.start()
-        update_status(conn,cur,{'status': 'dbproc started', 'value': p.pid, 'units': 'pid'})
+        update_status(conn,cur,{'time': time.time(), 'event': 'dbproc started', 'pid': p.pid})
         db_procs.append(p)
         logger.debug("created db process {}".format(p.name))
 
-    update_status(conn,cur,{'status': 'all processes spawned', 'value': 1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'all processes spawned'})
 
     # wait for directory queue to be empty
     dir_queue.join()
     logger.debug("joined dir_queue")
-    update_status(conn,cur,{'status': 'processed all dirs', 'value': 1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'processed all dirs'})
     for p in walker_procs:
         dir_queue.put(None)
     logger.debug("sent sentinel to walker processes")
@@ -630,7 +612,7 @@ def begin_scan():
     # wait for file queue to be empty
     file_queue.join()
     logger.debug("joined file_queue")
-    update_status(conn,cur,{'status': 'processed all files', 'value': 1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'processed all files'})
     for p in stater_procs:
         file_queue.put(None)
     logger.debug("sent sentinel to stater processes")
@@ -638,13 +620,13 @@ def begin_scan():
     # wait for db queue to be empty
     db_queue.join()
     logger.debug("joined db_queue")
-    update_status(conn,cur,{'status': 'processed all DB commits', 'value': 1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'processed all DB commits'})
     for p in db_procs:
         db_queue.put(None)
     logger.debug("sent sentinel to db processes")
 
     # ending crawl
-    update_status(conn,cur,{'status': 'end', 'value':1, 'units': 'event'})
+    update_status(conn,cur,{'time': time.time(), 'event': 'end'})
 
     # close logging
     log_queue.join()
